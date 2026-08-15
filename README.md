@@ -23,14 +23,23 @@ mechanism for a dead agent in a live server. This plugin is that mechanism:
 
 ## Install
 
+From the marketplace:
+
+```bash
+herdr plugin install terafin/herdr-restart-always
+herdr plugin action invoke herdr-restart-always.supervise-all
+```
+
+Or develop locally:
+
 ```bash
 herdr plugin link ~/herdr-restart-always
 herdr plugin action invoke herdr-restart-always.supervise-all
 ```
 
-If the server is already running when you link, the action is required once
-(hooks don't fire for a freshly-linked plugin). `startup` runs the same scan on
-every server start.
+If the server is already running when you install/link, the action is required
+once (hooks don't fire for a freshly-added plugin). `startup` runs the same
+scan on every server start.
 
 **Required config** — set this in herdr's `config.toml` on every host running
 the plugin, so herdr's native restore doesn't race the plugin at server start:
