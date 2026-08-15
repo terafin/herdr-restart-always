@@ -12,6 +12,11 @@ process dies inside a RUNNING server. This plugin covers both:
                                 herdr restores a bare shell; the plugin's own
                                 registry (written while the agent was last
                                 alive) still knows what to resume.
+  * reaped pane              -> herdr reaps a pane whose foreground process
+                                died, so there is no pane to relaunch into. The
+                                monitor RECREATES the pane (same workspace, else
+                                the first live one, else a new workspace) and
+                                resumes the agent into it instead of giving up.
 
 Agent-agnostic: the resume command comes from a per-agent table matching
 herdr's native restore commands (claude, hermes, codex, pi, opencode, ...),
@@ -446,6 +451,88 @@ def touch_lock(pane_id, heartbeat):
     tmp.replace(lock_path)
 
 
+def agent_started_in(pane_id, argv):
+    """Run argv in a pane and confirm the agent actually started.
+
+    `herdr pane run` succeeds silently (no result envelope on success), so its
+    return value cannot confirm a launch landed. Launch, then poll the pane for
+    a live foreground process.
+    """
+    pane_run(pane_id, argv)
+    for _ in range(5):
+        time.sleep(1)
+        if pane_has_running_process(pane_id):
+            return True
+    return False
+
+
+def recreate_pane(pane_id, config):
+    """Recreate a pane that herdr reaped and resume the supervised agent in it.
+
+    Returns the new pane_id, or None if the agent isn't known or no pane could
+    be created. herdr reaps a pane whose foreground agent process died, and a
+    dead pane cannot be relaunched into — the old monitor "gave up" and the bot
+    sat dead forever. Instead, create a fresh pane: reuse the pane's original
+    workspace when it still exists, else the first live workspace, else a brand
+    new workspace, then launch the agent's resume argv in it (exactly like a
+    server restore would).
+    """
+    registry = load_registry()
+    entry = registry.get(pane_id) or {}
+    agent = entry.get("agent")
+    value = entry.get("value")
+    if not agent or not value:
+        return None
+    argv = resume_argv(
+        {"pane_id": pane_id, "agent_session": {"agent": agent, "value": value}},
+        config,
+        registry,
+    )
+    if not argv:
+        log(f"recreate pane={pane_id}: no resume argv for agent={agent}")
+        return None
+
+    old_ws = str(pane_id).split(":", 1)[0]
+    workspaces = (invoke(["workspace", "list"]) or {}).get("workspaces") or []
+    existing = [w.get("workspace_id") for w in workspaces if w.get("workspace_id")]
+    target_ws = old_ws if old_ws in existing else (existing[0] if existing else None)
+
+    if not target_ws:
+        result = invoke(
+            [
+                "workspace", "create",
+                "--label", "herdr-restart-always",
+                "--cwd", str(Path.home()),
+            ]
+        )
+        if not result:
+            log(f"recreate pane={pane_id}: workspace create failed")
+            return None
+        new_pane = (result.get("root_pane") or {}).get("pane_id")
+        if not new_pane:
+            log(f"recreate pane={pane_id}: workspace create returned no pane")
+            return None
+        log(f"recreate pane={pane_id}: created workspace, pane={new_pane}")
+        if agent_started_in(new_pane, argv):
+            return new_pane
+        log(f"recreate pane={pane_id}: agent did not start in {new_pane}")
+        return None
+
+    result = invoke(["tab", "create", "--workspace", target_ws])
+    if not result:
+        log(f"recreate pane={pane_id}: tab create failed in workspace={target_ws}")
+        return None
+    new_pane = (result.get("root_pane") or {}).get("pane_id")
+    if not new_pane:
+        log(f"recreate pane={pane_id}: tab create returned no pane")
+        return None
+    log(f"recreate pane={pane_id}: tab created in {target_ws}, pane={new_pane}")
+    if agent_started_in(new_pane, argv):
+        return new_pane
+    log(f"recreate pane={pane_id}: agent did not start in {new_pane}")
+    return None
+
+
 def run_monitor(pane_id, config):
     """Detached per-pane watchdog: relaunch the agent whenever it's dead.
 
@@ -493,7 +580,28 @@ def run_monitor(pane_id, config):
             if pane_missing_since is None:
                 pane_missing_since = now
             elif now - pane_missing_since > config["pane_gone_grace_seconds"]:
-                log(f"monitor giving up pane={pane_id} (pane gone {now - pane_missing_since:.0f}s)")
+                log(f"monitor pane={pane_id} gone {now - pane_missing_since:.0f}s — recreating pane")
+                new_pane = recreate_pane(pane_id, config)
+                if new_pane:
+                    registry = load_registry()
+                    entry = registry.pop(pane_id, None)
+                    if entry:
+                        entry["updated_at"] = int(time.time())
+                        registry[new_pane] = entry
+                        save_registry(registry)
+                    log(f"monitor recreated pane {pane_id} -> {new_pane}")
+                    cleanup_monitor(pane_id)
+                    pane_id = new_pane
+                    if not claim_lock(pane_id):
+                        log(f"monitor exiting pane={pane_id} (recreated pane already held)")
+                        return
+                    # Fresh pane: restart the connect grace window.
+                    pane_missing_since = None
+                    first_seen = None
+                    saw_alive = False
+                    last_relaunch = now
+                    continue
+                log(f"monitor giving up pane={pane_id} (recreate failed after {now - pane_missing_since:.0f}s)")
                 break
             time.sleep(config["poll_seconds"])
             continue
