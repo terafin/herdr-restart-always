@@ -64,6 +64,18 @@ are idempotent and a crashed monitor is re-spawned by the next event or the
 next server start. A `pane.exited` death is caught by the monitor's poll within
 `poll_seconds`.
 
+## Build compatibility
+
+Some herdr builds (e.g. the brew `0.8.0` bottle) do not expose `agent_session`
+anywhere in the pane/agent API — `pane get/list` reports `agent` and
+`agent_status` but never a session value. The plugin therefore derives the
+resume reference **build-independently**: it prefers the live `agent_session`
+(newer builds), then its own registry, then the pane's live process argv
+(`pane process-info` exposes the original `--resume <uuid>` in every build).
+That same build-independence governs the death check — a supervised pane whose
+foreground has returned to a bare idle shell is dead, whatever `agent_status`
+says.
+
 Guards against double-launch:
 * `agent_status` must be `unknown` (agent not alive);
 * the pane's foreground must be back to an idle shell (process-info check —

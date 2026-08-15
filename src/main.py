@@ -70,9 +70,85 @@ DEFAULT_COMMANDS = {
     "mastracode": "mastracode --thread {value}",
 }
 
-# agent_status values herdr reports; anything else on a supervised pane means
-# "no live agent" -> needs a relaunch.
+# agent_status values herdr reports. NOT a hard relaunch gate: herdr builds
+# disagree on what a dead pane reports ("0.8.0" covers APIs where agent_session
+# exists and APIs where it doesn't, and death may surface as `unknown` or as a
+# stale `idle`). The authoritative "is the agent really gone" check is the pane
+# process-info foreground guard (pane_has_running_process); the status is only
+# used for the first-contact grace window.
 ALIVE_STATUSES = {"idle", "working", "blocked", "done"}
+
+
+def resume_flag_for(agent):
+    """The argv flag that carries the resume value for an agent kind.
+
+    Derived from DEFAULT_COMMANDS so there is ONE source of truth: the token
+    right before {value} in the resume template, `=`-stripped. Examples:
+    claude "--resume {value}" -> --resume; codex "resume {value}" -> resume;
+    omp "--resume={value}" -> --resume. None when unknown.
+    """
+    template = DEFAULT_COMMANDS.get(agent)
+    if not template:
+        return None
+    try:
+        parts = shlex.split(template)
+    except ValueError:
+        return None
+    for i, token in enumerate(parts):
+        if "{value}" in token:
+            if token != "{value}":
+                # flag and value in one token: "--resume={value}" -> "--resume"
+                return token.split("{value}")[0].rstrip("=")
+            if i > 0:
+                # separate tokens: "--resume" "{value}" -> "--resume"
+                return parts[i - 1].rstrip("=")
+            break
+    return None
+
+
+def session_from_process_info(pane_id, agent=None):
+    """Derive {agent, value} from the pane's LIVE process argv.
+
+    Some herdr builds (e.g. brew 0.8.0) do not expose agent_session anywhere in
+    the pane/agent API, but pane process-info reports the full foreground argv
+    in EVERY build — including the original resume flag (claude --resume
+    <uuid>). This is the build-independent session source: it lets the plugin
+    supervise a pane it never saw an agent_session for.
+    """
+    result = invoke(["pane", "process-info", "--pane", pane_id])
+    if not result:
+        return None
+    info = result.get("process_info") or {}
+    best = None
+    for proc in info.get("foreground_processes") or []:
+        argv = proc.get("argv") or []
+        if not argv:
+            continue
+        name = os.path.basename(str(argv[0]))
+        if agent and name != agent:
+            continue
+        flag = resume_flag_for(name)
+        if not flag:
+            continue
+        for i, token in enumerate(argv):
+            if token == flag and i + 1 < len(argv):
+                value = argv[i + 1]
+                if value.startswith("-"):
+                    continue  # a flag can't be the value; keep scanning
+                best = {"agent": name, "kind": "id", "value": value, "source": "process-info"}
+        for token in argv:
+            if token.startswith(flag + "="):
+                best = {"agent": name, "kind": "id", "value": token.split("=", 1)[1], "source": "process-info"}
+    return best
+
+
+def pane_session_value(pane):
+    """The session value a pane is/was running, via agent_session or process-info."""
+    session = pane.get("agent_session") or {}
+    if session.get("value"):
+        return session["value"]
+    derived = session_from_process_info(pane.get("pane_id"), pane.get("agent"))
+    return (derived or {}).get("value")
 
 
 def env_first(*names):
@@ -210,14 +286,21 @@ def load_config():
 def resume_argv(pane, config, registry=None):
     """Resume argv for a pane, or None if it isn't a supervised agent pane.
 
-    Uses the LIVE agent_session first (preferred — freshest reference); falls
-    back to the registry entry so a pane that died and lost its live session
-    (or was restored as a bare shell) still knows what to resume.
+    Fallback order for the session value: LIVE agent_session (freshest) ->
+    registry (survives death/restores) -> process-info argv (builds with no
+    agent_session field). The process-info leg matters when the registry is
+    empty and the pane's agent is alive but the build never reports
+    agent_session (brew 0.8.0).
     """
     pane_id = pane.get("pane_id")
     session = pane.get("agent_session") or (registry or {}).get(pane_id, {})
     agent = session.get("agent") or pane.get("agent")
     value = session.get("value")
+    if not value:
+        derived = session_from_process_info(pane_id, agent)
+        if derived:
+            agent = derived.get("agent") or agent
+            value = derived.get("value")
     if not agent or not value:
         return None
     template = config["commands"].get(agent)
@@ -252,8 +335,17 @@ def save_registry(registry):
 
 
 def remember_session(pane):
-    """Record a live agent_session so we can resume after the agent dies."""
+    """Record the pane's resume ref so we can restart it after the agent dies.
+
+    Live agent_session first (newer builds); falls back to deriving the ref
+    from the pane's live process argv (builds like brew 0.8.0 that never
+    expose agent_session). Without the fallback those builds supervise nothing.
+    """
     session = pane.get("agent_session") or {}
+    if not session.get("agent") or not session.get("value"):
+        derived = session_from_process_info(pane.get("pane_id"), pane.get("agent"))
+        if derived:
+            session = derived
     if not session.get("agent") or not session.get("value"):
         return False
     registry = load_registry()
@@ -387,8 +479,7 @@ def run_monitor(pane_id, config):
             adopted = None
             if wanted:
                 for candidate in pane_list():
-                    sess = candidate.get("agent_session") or {}
-                    if sess.get("value") == wanted:
+                    if pane_session_value(candidate) == wanted:
                         adopted = candidate["pane_id"]
                         break
             if adopted and adopted != pane_id:
@@ -419,9 +510,13 @@ def run_monitor(pane_id, config):
         # report alive before we declare it dead (avoids double-launch on
         # monitor spawn during a connect window).
         ready_at = first_seen + (0 if saw_alive else config["connect_grace_seconds"])
+        # Dead = supervised (argv) + the pane has returned to a bare idle shell.
+        # The foreground process guard is the AUTHORITATIVE liveness check (a
+        # running agent is never a bare shell, so it can't false-relaunch); the
+        # agent_status value is NOT part of the gate because herdr builds
+        # disagree on what a dead pane reports (unknown vs stale idle).
         if (
             argv
-            and status not in ALIVE_STATUSES
             and now >= ready_at
             and now - last_relaunch >= config["cooldown_seconds"]
             and not pane_has_running_process(pane_id)
@@ -479,6 +574,8 @@ def ensure_monitor(pane):
     """Remember the pane's session and supervise it — only for agent panes."""
     if remember_session(pane):
         spawn_monitor(pane["pane_id"])
+        return True
+    return False
 
 
 def resume_monitoring():
@@ -493,8 +590,10 @@ def scan_all(config):
     resume_monitoring()
     started = 0
     for pane in pane_list():
-        if pane.get("agent_session"):
-            ensure_monitor(pane)
+        # ensure_monitor decides: it remembers the pane's session from the live
+        # agent_session OR (on builds without that field) from its process argv,
+        # and only supervises panes that actually carry an agent session.
+        if ensure_monitor(pane):
             started += 1
     # Also cover supervised panes that currently show no live agent_session
     # (server restart restored them as bare shells): the registry knows them.
