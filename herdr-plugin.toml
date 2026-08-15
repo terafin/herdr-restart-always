@@ -1,0 +1,63 @@
+# herdr-restart-always — always restart whatever the pane is running.
+#
+# Supervises agent panes and re-runs their resume command whenever the agent
+# dies — the gap herdr leaves in a RUNNING server (native restore only fires
+# on server restart). Agent-agnostic: any agent herdr can detect (claude,
+# hermes, codex, pi, opencode, ...) is relaunched into its previous session.
+
+id = "herdr-restart-always"
+name = "Herdr Restart Always"
+version = "0.1.0"
+min_herdr_version = "0.7.5"
+description = "Watch supervised agent panes and re-run their resume command whenever the agent dies (live-server agent death and server restarts). Agent-agnostic."
+platforms = ["linux", "macos"]
+
+# Server start: scan all panes, start a monitor for every supervised pane.
+[[startup]]
+command = ["/usr/bin/python3", "src/main.py", "startup"]
+
+# An agent appeared (or was re-detected after a restart): make sure a monitor
+# covers its pane, and refresh the resume registry.
+[[events]]
+on = "pane.agent_detected"
+command = ["/usr/bin/python3", "src/main.py", "hook-pane"]
+
+# The agent's status changed (working/idle/done/unknown). The pane dying makes
+# this fire (agent_status -> unknown); a monitor already in place will act.
+[[events]]
+on = "pane.agent_status_changed"
+command = ["/usr/bin/python3", "src/main.py", "hook-pane"]
+
+# The pane's process tree exited. Death fast-path trigger; the monitor is the
+# single relauncher so there is no double-launch between event and poll.
+[[events]]
+on = "pane.exited"
+command = ["/usr/bin/python3", "src/main.py", "hook-pane"]
+
+[[actions]]
+id = "supervise-all"
+title = "Restart Always: scan all panes and start monitors"
+description = "Scan every pane; start a monitor for each supervised pane."
+contexts = ["global"]
+command = ["/usr/bin/python3", "src/main.py", "supervise-all"]
+
+[[actions]]
+id = "status"
+title = "Restart Always: status"
+description = "Show supervised panes, live monitors, and recent restarts."
+contexts = ["global"]
+command = ["/usr/bin/python3", "src/main.py", "status"]
+
+[[actions]]
+id = "stop"
+title = "Restart Always: stop monitoring"
+description = "Stop all restart-always monitors."
+contexts = ["global"]
+command = ["/usr/bin/python3", "src/main.py", "stop"]
+
+[[actions]]
+id = "logs"
+title = "Restart Always: logs"
+description = "Print recent restart-always log lines."
+contexts = ["global"]
+command = ["/usr/bin/python3", "src/main.py", "logs"]
