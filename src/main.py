@@ -319,10 +319,35 @@ def monitor_stop_path(pane_id):
     return state_dir() / "monitors" / f"{pane_id.replace(':', '_')}.stop"
 
 
-def write_lock(pane_id, heartbeat):
+def claim_lock(pane_id):
+    """Claim the monitor lock for a pane; False if a live monitor holds it."""
+    lock_path = monitor_lock_path(pane_id)
+    try:
+        with open(lock_path, encoding="utf-8") as handle:
+            existing = json.load(handle)
+        pid = existing.get("pid")
+        if pid:
+            try:
+                os.kill(pid, 0)
+                return False  # a live monitor already holds this pane
+            except (ProcessLookupError, PermissionError):
+                pass  # stale lock from a dead monitor; reclaim
+    except (FileNotFoundError, json.JSONDecodeError):
+        pass
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
     lock = {"pid": os.getpid(), "heartbeat": int(time.time()), "pane_id": pane_id}
+    tmp = lock_path.with_suffix(".json.tmp")
+    with open(tmp, "w", encoding="utf-8") as handle:
+        json.dump(lock, handle)
+    tmp.replace(lock_path)
+    return True
+
+
+def touch_lock(pane_id, heartbeat):
+    """Refresh the heartbeat of a lock this monitor already owns."""
     lock_path = monitor_lock_path(pane_id)
     lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock = {"pid": os.getpid(), "heartbeat": int(heartbeat), "pane_id": pane_id}
     tmp = lock_path.with_suffix(".json.tmp")
     with open(tmp, "w", encoding="utf-8") as handle:
         json.dump(lock, handle)
@@ -335,7 +360,9 @@ def run_monitor(pane_id, config):
     Spawned detached (start_new_session), so no os.setsid() here. This is the
     SINGLE relauncher for its pane — hooks only spawn it, never relaunch.
     """
-    write_lock(pane_id, time.time())
+    if not claim_lock(pane_id):
+        log(f"monitor refused pane={pane_id} (another monitor holds it)")
+        return
     last_relaunch = 0.0
     pane_missing_since = None
     first_seen = None
@@ -352,6 +379,26 @@ def run_monitor(pane_id, config):
         if first_seen is None:
             first_seen = now
         if pane is None:
+            # A server restore can renumber a pane (w2:p1 -> w2:p2). If our
+            # pane id is gone, adopt any pane reporting the session we were
+            # supervising — the registry survives restarts, pane ids don't.
+            registry = load_registry()
+            wanted = (registry.get(pane_id) or {}).get("value")
+            adopted = None
+            if wanted:
+                for candidate in pane_list():
+                    sess = candidate.get("agent_session") or {}
+                    if sess.get("value") == wanted:
+                        adopted = candidate["pane_id"]
+                        break
+            if adopted and adopted != pane_id:
+                log(f"monitor adopting renumbered pane {pane_id} -> {adopted}")
+                cleanup_monitor(pane_id)
+                pane_id = adopted
+                if not claim_lock(pane_id):
+                    log(f"monitor exiting pane={pane_id} (adopted pane already held)")
+                    return
+                continue
             if pane_missing_since is None:
                 pane_missing_since = now
             elif now - pane_missing_since > config["pane_gone_grace_seconds"]:
@@ -383,7 +430,7 @@ def run_monitor(pane_id, config):
             pane_run(pane_id, argv)
             last_relaunch = now
 
-        write_lock(pane_id, now)
+        touch_lock(pane_id, now)
         time.sleep(config["poll_seconds"])
 
     cleanup_monitor(pane_id)
@@ -429,9 +476,9 @@ def event_pane_id():
 
 
 def ensure_monitor(pane):
-    """Remember the pane's session and make sure a monitor covers it."""
-    remember_session(pane)
-    spawn_monitor(pane["pane_id"])
+    """Remember the pane's session and supervise it — only for agent panes."""
+    if remember_session(pane):
+        spawn_monitor(pane["pane_id"])
 
 
 def resume_monitoring():

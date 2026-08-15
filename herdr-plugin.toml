@@ -16,6 +16,12 @@ platforms = ["linux", "macos"]
 [[startup]]
 command = ["/usr/bin/python3", "src/main.py", "startup"]
 
+# A pane was created (incl. restore): if it's an agent pane, supervise it.
+# Covers the startup-scan running before a slow restore finishes.
+[[events]]
+on = "pane.created"
+command = ["/usr/bin/python3", "src/main.py", "hook-pane"]
+
 # An agent appeared (or was re-detected after a restart): make sure a monitor
 # covers its pane, and refresh the resume registry.
 [[events]]
