@@ -19,7 +19,11 @@ mechanism for a dead agent in a live server. This plugin is that mechanism:
   in that pane (`herdr pane run`);
 * the plugin's own **registry** (written while the agent was last alive)
   survives restarts, so even a server restart that restored the pane as a bare
-  shell (snapshot saved while the agent was dead) still knows what to resume.
+  shell (snapshot saved while the agent was dead) still knows what to resume;
+* if herdr **reaps the pane entirely** (a pane whose foreground process died
+  is removed from the session), the monitor recreates it — same workspace if it
+  still exists, else the first live workspace, else a brand-new workspace — and
+  resumes the agent into it. A reaped pane is recreated instead of abandoned.
 
 ## Install
 

@@ -7,7 +7,7 @@
 
 id = "herdr-restart-always"
 name = "Herdr Restart Always"
-version = "0.1.1"
+version = "0.1.2"
 min_herdr_version = "0.7.5"
 description = "Watch supervised agent panes and re-run their resume command whenever the agent dies (live-server agent death and server restarts). Agent-agnostic."
 platforms = ["linux", "macos"]
