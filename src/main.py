@@ -241,6 +241,70 @@ def pane_run(pane_id, argv):
 SHELL_NAMES = {"zsh", "bash", "sh", "dash", "ksh", "fish", "nu", "pwsh", "ash"}
 
 
+def session_running_elsewhere(value, pane_id, agent):
+    """True if a supervised session (its resume value) is already alive in a
+    claude process that is NOT this pane's.
+
+    The pane-local foreground guard (pane_has_running_process) can't see a
+    manual resume of the SAME session in a second terminal/attach: the pane
+    went idle, so the monitor relaunches the session -> two claude processes
+    fight for the same session + a2a port. Before relaunching, scan EVERY live
+    claude process's full argv for a `--resume <value>` token pair. The resume
+    value can sit anywhere in argv (claude's real argv is `claude --settings
+    {...} --resume <uuid>`), so an adjacent-args pgrep finds nothing — tokenize
+    the whole argv and look for the pair. Stand down if found.
+    """
+    if not value or not agent:
+        return False
+    template = DEFAULT_COMMANDS.get(agent)
+    if not template:
+        return False  # unknown agent kind -> can't identify its process/flag
+    try:
+        proc_name = shlex.split(template)[0]
+    except (ValueError, IndexError):
+        return False
+    flag = resume_flag_for(agent)
+    if not flag:
+        return False
+    try:
+        out = subprocess.run(
+            ["pgrep", "-a", "-x", proc_name],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except Exception:
+        return False  # fail-open on error: don't block a legit relaunch
+    pane_pid_val = pane_pid(pane_id)
+    for line in out.stdout.splitlines():
+        try:
+            pid, rest = line.split(" ", 1)
+            pid = int(pid)
+        except (ValueError, IndexError):
+            continue
+        if pid == os.getpid() or pid == pane_pid_val:
+            continue  # skip our own process / the pane's own foreground
+        tokens = rest.split()
+        for i, tok in enumerate(tokens):
+            if tok == flag and i + 1 < len(tokens) and tokens[i + 1] == value:
+                return True
+            if tok.startswith(flag + "=") and tok.split("=", 1)[1] == value:
+                return True
+    return False
+
+
+def pane_pid(pane_id):
+    """PID of the foreground process running in a pane, else None."""
+    result = invoke(["pane", "process-info", "--pane", pane_id])
+    if not result:
+        return None
+    info = result.get("process_info") or {}
+    for proc in info.get("foreground_processes") or []:
+        for pid in proc.get("pids") or []:
+            return int(pid)
+    return None
+
+
 def pane_has_running_process(pane_id):
     """True if the pane is running something besides its idle shell.
 
@@ -459,7 +523,10 @@ def agent_started_in(pane_id, argv):
     a live foreground process.
     """
     pane_run(pane_id, argv)
-    for _ in range(5):
+    # 15s, not 5s: a --resume with a large transcript triggers claude's >200MB
+    # auto-trim on cold start, which can push the first foreground process past
+    # a 5s window -> a healthy launch would read as failed and get relaunched.
+    for _ in range(15):
         time.sleep(1)
         if pane_has_running_process(pane_id):
             return True
@@ -469,13 +536,19 @@ def agent_started_in(pane_id, argv):
 def recreate_pane(pane_id, config):
     """Recreate a pane that herdr reaped and resume the supervised agent in it.
 
-    Returns the new pane_id, or None if the agent isn't known or no pane could
-    be created. herdr reaps a pane whose foreground agent process died, and a
-    dead pane cannot be relaunched into — the old monitor "gave up" and the bot
-    sat dead forever. Instead, create a fresh pane: reuse the pane's original
-    workspace when it still exists, else the first live workspace, else a brand
-    new workspace, then launch the agent's resume argv in it (exactly like a
-    server restore would).
+    Returns the new pane_id, or None if the agent isn't known / already running
+    elsewhere / no pane could be created.
+
+    herdr reaps a pane whose foreground agent process died, and a dead pane
+    cannot be relaunched into -- the old monitor "gave up" and the bot sat dead
+    forever. Instead: FIRST check the session isn't already alive in another
+    pane/process (a manual resume or a renumbered pane) -- if it is, STAND DOWN
+    (no duplicate). Then reuse an existing IDLE pane in the original workspace
+    (or the first live workspace), only splitting/creating a fresh pane when no
+    idle one exists. Launch the agent's resume argv in it (exactly like a
+    server restore would). Do NOT loop: if the agent fails to start, return None
+    and let the monitor give up -- a stuck relaunch is better diagnosed than
+    re-spawned into an unbounded pane-creation loop.
     """
     registry = load_registry()
     entry = registry.get(pane_id) or {}
@@ -492,12 +565,50 @@ def recreate_pane(pane_id, config):
         log(f"recreate pane={pane_id}: no resume argv for agent={agent}")
         return None
 
+    # STAND DOWN if the session is already alive somewhere else (a manual
+    # resume, a renumbered pane that re-adopted the session, or a duplicate
+    # monitor that relaunched it). Recreating now would spawn a duplicate.
+    if session_running_elsewhere(value, pane_id, agent):
+        log(f"recreate pane={pane_id}: session {value} already running elsewhere -- standing down")
+        return None
+
     old_ws = str(pane_id).split(":", 1)[0]
     workspaces = (invoke(["workspace", "list"]) or {}).get("workspaces") or []
     existing = [w.get("workspace_id") for w in workspaces if w.get("workspace_id")]
     target_ws = old_ws if old_ws in existing else (existing[0] if existing else None)
 
-    if not target_ws:
+    # REUSE an existing idle pane in the target workspace if one exists -- do
+    # NOT spawn a new pane while an idle one can host the resume.
+    if target_ws:
+        reused = None
+        for cand in pane_list():
+            if not cand.get("workspace_id") == target_ws:
+                continue
+            cand_id = cand.get("pane_id")
+            if cand_id == pane_id:
+                continue  # the very pane we're replacing
+            if cand.get("agent") or cand.get("agent_session"):
+                continue  # already hosts an agent
+            if pane_has_running_process(cand_id):
+                continue  # busy (running something besides a bare shell)
+            reused = cand_id
+            break
+        if reused:
+            log(f"recreate pane={pane_id}: reusing idle pane {reused}")
+            if agent_started_in(reused, argv):
+                return reused
+            log(f"recreate pane={pane_id}: agent did not start in reused pane {reused}")
+            return None
+        result = invoke(["tab", "create", "--workspace", target_ws])
+        if not result:
+            log(f"recreate pane={pane_id}: tab create failed in workspace={target_ws}")
+            return None
+        new_pane = (result.get("root_pane") or {}).get("pane_id")
+        if not new_pane:
+            log(f"recreate pane={pane_id}: tab create returned no pane")
+            return None
+        log(f"recreate pane={pane_id}: tab created in {target_ws}, pane={new_pane}")
+    else:
         result = invoke(
             [
                 "workspace", "create",
@@ -513,25 +624,11 @@ def recreate_pane(pane_id, config):
             log(f"recreate pane={pane_id}: workspace create returned no pane")
             return None
         log(f"recreate pane={pane_id}: created workspace, pane={new_pane}")
-        if agent_started_in(new_pane, argv):
-            return new_pane
-        log(f"recreate pane={pane_id}: agent did not start in {new_pane}")
-        return None
 
-    result = invoke(["tab", "create", "--workspace", target_ws])
-    if not result:
-        log(f"recreate pane={pane_id}: tab create failed in workspace={target_ws}")
-        return None
-    new_pane = (result.get("root_pane") or {}).get("pane_id")
-    if not new_pane:
-        log(f"recreate pane={pane_id}: tab create returned no pane")
-        return None
-    log(f"recreate pane={pane_id}: tab created in {target_ws}, pane={new_pane}")
     if agent_started_in(new_pane, argv):
         return new_pane
     log(f"recreate pane={pane_id}: agent did not start in {new_pane}")
     return None
-
 
 def run_monitor(pane_id, config):
     """Detached per-pane watchdog: relaunch the agent whenever it's dead.
@@ -623,11 +720,17 @@ def run_monitor(pane_id, config):
         # running agent is never a bare shell, so it can't false-relaunch); the
         # agent_status value is NOT part of the gate because herdr builds
         # disagree on what a dead pane reports (unknown vs stale idle).
+        # The session value to look for elsewhere is the pane's own session id,
+        # NOT "first non-dash arg" (that returns argv[0]=="claude"). Reuse the
+        # plugin's canonical extractor so the elsewhere-guard actually matches.
+        _resume_value = pane_session_value(pane)
+        _agent = os.path.basename(argv[0]) if argv else None
         if (
             argv
             and now >= ready_at
             and now - last_relaunch >= config["cooldown_seconds"]
             and not pane_has_running_process(pane_id)
+            and not session_running_elsewhere(_resume_value, pane_id, _agent)
         ):
             log(f"relaunch pane={pane_id} status={status} agent={pane.get('agent')} argv={' '.join(argv)}")
             pane_run(pane_id, argv)
