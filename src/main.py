@@ -114,6 +114,31 @@ def resume_flag_for(agent):
     return None
 
 
+INTERPRETERS = ("python", "node", "bun", "deno", "ruby", "perl")
+
+
+def agent_argv(argv):
+    """argv with a leading script interpreter dropped.
+
+    An agent installed as a script entry point (hermes is a Python console
+    script) runs as `python /path/to/hermes --resume <id>`: argv[0] is the
+    interpreter, so matching on it never finds the agent. Drop interpreter
+    args up to the script path so argv[0] names the agent. Matches python,
+    python3, python3.12, node, ...
+    """
+    argv = [str(a) for a in argv]
+    if not argv:
+        return argv
+    name = os.path.basename(argv[0])
+    if not any(name == i or name.startswith(i) and name[len(i):].replace(".", "").isdigit()
+               for i in INTERPRETERS):
+        return argv
+    for i, token in enumerate(argv[1:], start=1):
+        if not token.startswith("-"):
+            return argv[i:]  # first non-flag arg is the script
+    return argv
+
+
 def session_from_process_info(pane_id, agent=None):
     """Derive {agent, value} from the pane's LIVE process argv.
 
@@ -129,7 +154,7 @@ def session_from_process_info(pane_id, agent=None):
     info = result.get("process_info") or {}
     best = None
     for proc in info.get("foreground_processes") or []:
-        argv = proc.get("argv") or []
+        argv = agent_argv(proc.get("argv") or [])
         if not argv:
             continue
         name = os.path.basename(str(argv[0]))
@@ -783,7 +808,12 @@ def run_monitor(pane_id, config):
         # NOT "first non-dash arg" (that returns argv[0]=="claude"). Reuse the
         # plugin's canonical extractor so the elsewhere-guard actually matches.
         _resume_value = pane_session_value(pane)
-        _agent = os.path.basename(argv[0]) if argv else None
+        # The agent KIND (claude/hermes/...), not the resume command's argv[0]: with a
+        # config.json command override argv[0] is a wrapper script (e.g.
+        # herdr-agent-state.sh), which DEFAULT_COMMANDS doesn't know, so the
+        # elsewhere-guard silently failed open on every overridden host.
+        _session = pane.get("agent_session") or registry.get(pane_id, {})
+        _agent = _session.get("agent") or pane.get("agent")
         if (
             argv
             and now >= ready_at
