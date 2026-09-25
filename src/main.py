@@ -35,6 +35,9 @@ Conventions
     monitors/      one lock file per pane: {pid, socket, heartbeat}
     stop-<pid>     sentinel a monitor checks to exit
     log.txt        restart log
+* config.json `require_env` (optional) scopes supervision to hosts that set
+  one of the named env vars (os.environ or /etc/environment); elsewhere the
+  plugin is inert.
 """
 
 import json
@@ -349,7 +352,60 @@ def load_config():
         "sweep_seconds": int(config.get("sweep_seconds", 60)),
         "pane_gone_grace_seconds": int(config.get("pane_gone_grace_seconds", 120)),
         "commands": {**DEFAULT_COMMANDS, **config.get("commands", {})},
+        "require_env": _env_names(config.get("require_env")),
     }
+
+
+def _env_names(value):
+    """Normalize require_env: a name or list of names -> list of names."""
+    if isinstance(value, str):
+        value = [value]
+    if not isinstance(value, list):
+        return []
+    return [name.strip() for name in value if isinstance(name, str) and name.strip()]
+
+
+def etc_environment():
+    """KEY=VALUE pairs from /etc/environment (pam_env format), quotes stripped.
+
+    Read directly rather than trusting os.environ: herdr servers started by a
+    systemd user unit or a non-login shell never see /etc/environment.
+    """
+    values = {}
+    try:
+        with open("/etc/environment", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, val = line.partition("=")
+                values[key.strip()] = val.strip().strip("\"'")
+    except OSError:
+        pass
+    return values
+
+
+def supervision_enabled(config):
+    """True unless require_env is set and none of its variables is non-empty.
+
+    require_env marks which hosts the plugin should supervise at all (e.g.
+    only fleet bots that export CLAUDE_BOT_NAME). Without it, a host that
+    merely shares the config would relaunch every ad-hoc agent pane it sees,
+    typing resume commands into panes that were never meant to be supervised.
+    Unset/empty require_env keeps the default: supervise everywhere.
+    """
+    names = config.get("require_env") or []
+    if not names:
+        return True
+    etc = None
+    for name in names:
+        if os.environ.get(name):
+            return True
+        if etc is None:
+            etc = etc_environment()
+        if etc.get(name):
+            return True
+    return False
 
 
 def resume_argv(pane, config, registry=None):
@@ -649,6 +705,9 @@ def run_monitor(pane_id, config):
         if is_stop_requested(pane_id):
             log(f"monitor stopping pane={pane_id} (stop requested)")
             break
+        if not supervision_enabled(config):
+            log(f"monitor stopping pane={pane_id} (require_env {config['require_env']} unmet)")
+            break
 
         pane = pane_get(pane_id)
         now = time.time()
@@ -824,6 +883,8 @@ def action_status(config):
     lines = []
     registry = load_registry()
     lines.append(f"Poll interval: {config['poll_seconds']}s   cooldown: {config['cooldown_seconds']}s")
+    if not supervision_enabled(config):
+        lines.append(f"INACTIVE on this host: require_env {config['require_env']} unmet (no panes supervised)")
     lines.append(f"Registry entries: {len(registry)}")
     for pane_id, entry in sorted(registry.items()):
         pid = monitor_pid(pane_id)
@@ -885,6 +946,13 @@ def tail_log(limit):
 def main():
     config = load_config()
     command = sys.argv[1] if len(sys.argv) > 1 else ""
+
+    # Gate every command that can supervise or relaunch; status/stop/logs
+    # stay available so an inactive host can still be inspected.
+    if command in ("startup", "hook-pane", "supervise-all", "monitor") and not supervision_enabled(config):
+        if command == "supervise-all":
+            print(f"Inactive on this host: require_env {config['require_env']} unmet; nothing supervised.")
+        return
 
     if command == "startup":
         scan_all(config)
