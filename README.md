@@ -98,12 +98,22 @@ Guards against double-launch:
   "connect_grace_seconds": 10,
   "commands": {
     "claude": "claude --resume {value}"
-  }
+  },
+  "require_env": ["CLAUDE_BOT_NAME"]
 }
 ```
 
 `commands` overrides the built-in resume command per agent kind (`{value}` is
 the session id/path). Built-ins match herdr's native restore commands.
+
+`require_env` (optional) limits supervision to hosts where at least one of the
+named variables is non-empty, either in the plugin's environment or in
+`/etc/environment` (read directly, since herdr servers started from systemd
+units usually don't inherit it). On any other host the plugin is inert:
+startup, hooks and `supervise-all` do nothing, and running monitors stand
+down. Use it when one config is shared between supervised agent hosts and
+workstations whose agent panes must never be relaunched. If it's omitted or
+empty, every host is supervised.
 
 ## Actions
 
